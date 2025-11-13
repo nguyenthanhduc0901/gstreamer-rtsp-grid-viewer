@@ -1,5 +1,15 @@
 // main_pi_kms.cpp
 // Tối ưu cho Pi 4 2GB, chạy từ TTY, dùng kmssink Zero-Copy
+//
+// Cách build nhanh (trên Raspberry Pi / Linux):
+//   g++ main_pi_kms.cpp -o rtsp_kms_viewer \
+//       -std=c++17 -pthread \
+//       $(pkg-config --cflags --libs gstreamer-1.0 glib-2.0)
+//
+// Gợi ý gói cần thiết (tùy distro):
+//   sudo apt-get install -y build-essential pkg-config libglib2.0-dev \
+//       gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+//       gstreamer1.0-plugins-bad
 
 #include <gst/gst.h>
 
@@ -62,13 +72,16 @@ static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
     if (g_str_equal(encoding_name, "H265")) {
         sp->depay = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
         sp->parse = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
-        // Yêu cầu bộ giải mã phần cứng H.265
+        // Thử bộ giải mã phần cứng H.265 (tùy nền tảng có sẵn)
         sp->dec   = gst_element_factory_make("v4l2slh265dec", (sp->name + "_dec").c_str());
+        if (!sp->dec) sp->dec = gst_element_factory_make("v4l2h265dec", (sp->name + "_dec").c_str());
+        if (!sp->dec) sp->dec = gst_element_factory_make("avdec_h265", (sp->name + "_dec").c_str());
     } else if (g_str_equal(encoding_name, "H264")) {
         sp->depay = gst_element_factory_make("rtph264depay", (sp->name + "_depay").c_str());
         sp->parse = gst_element_factory_make("h264parse", (sp->name + "_parse").c_str());
-        // Yêu cầu bộ giải mã phần cứng H.264
+        // Thử bộ giải mã phần cứng H.264, fallback sang phần mềm
         sp->dec   = gst_element_factory_make("v4l2h264dec", (sp->name + "_dec").c_str());
+        if (!sp->dec) sp->dec = gst_element_factory_make("avdec_h264", (sp->name + "_dec").c_str());
     } else {
         g_printerr("[%s] Codec không được hỗ trợ: %s\n", sp->name.c_str(), encoding_name);
         gst_caps_unref(caps);
@@ -116,7 +129,7 @@ static bool build_and_play(StreamPipeline* sp) {
     // --- Cấu hình RTSP cho độ trễ thấp ---
     g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), NULL);
     g_object_set(G_OBJECT(sp->src), "latency", 0, NULL);
-    g_object_set(G_OBJECT(sp->src), "drop-on-lateness", TRUE, NULL);
+    // 'drop-on-lateness' không phải property của rtspsrc; dùng QoS/queue/sink để xử lý late frames
     g_object_set(G_OBJECT(sp->src), "protocols", 4 /* TCP */, NULL); // Ưu tiên TCP
 
     // --- Cấu hình KMSSink cho Zero-Copy và Grid ---
@@ -128,12 +141,11 @@ static bool build_and_play(StreamPipeline* sp) {
     gchar* rect = g_strdup_printf("<%d,%d,%d,%d>", x, y, w2, h2);
     
     g_object_set(G_OBJECT(sp->sink), 
-        // "plane-id", 3 + sp->index, // Dùng các "lớp" (plane) khác nhau
+        // "plane-id", 3 + sp->index, // Dùng các "lớp" (plane) khác nhau nếu cần
         "render-rectangle", rect,
         "sync", FALSE,       // Vẽ ngay khi có
         "async", FALSE,      // Giảm độ trễ
         "force-aspect-ratio", TRUE,
-        "can-scale", FALSE,  // Tắt scaling của kmssink, để phần cứng tự scale
         NULL);
     g_free(rect);
     

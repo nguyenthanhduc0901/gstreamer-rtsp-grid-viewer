@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
 
     g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), NULL);
     g_object_set(G_OBJECT(sp->src), "latency", 0, NULL); // strict low-latency per request
-    g_object_set(G_OBJECT(sp->src), "drop-on-lateness", TRUE, NULL); // drop late RTP to avoid buildup
+    // Note: 'drop-on-lateness' is not a valid property on rtspsrc; late frame dropping is handled by sink/QoS
     g_object_set(G_OBJECT(sp->sink), "sync", FALSE, NULL); // render ASAP to reduce lag
     g_object_set(G_OBJECT(sp->sink), "async", FALSE, NULL); // minimize preroll
     g_object_set(G_OBJECT(sp->sink), "force-aspect-ratio", TRUE, NULL);
