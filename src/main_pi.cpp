@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <memory>
 
 static const int SUB_W = 640;
 static const int SUB_H = 360;
@@ -222,19 +223,19 @@ int main(int argc, char** argv) {
     };
 
     // Create 4 pipelines mirroring the Windows approach
-    std::vector<StreamPipeline> pipes;
+    std::vector<std::unique_ptr<StreamPipeline>> pipes;
     pipes.reserve(4);
     for (int i = 0; i < 4; ++i) {
-        StreamPipeline sp{};
-        sp.name = std::string("cam") + std::to_string(i+1);
-        sp.url  = urls[i];
-        sp.win  = childWins[i];
+        auto sp = std::make_unique<StreamPipeline>();
+        sp->name = std::string("cam") + std::to_string(i+1);
+        sp->url  = urls[i];
+        sp->win  = childWins[i];
         pipes.push_back(std::move(sp));
     }
 
     // Start workers
     for (auto& sp : pipes) {
-        sp.worker = std::thread(pipeline_worker, &sp);
+        sp->worker = std::thread(pipeline_worker, sp.get());
     }
 
     // Basic X11 event loop; press 'q' or close the window to exit
@@ -256,9 +257,9 @@ int main(int argc, char** argv) {
     }
 
     // Shutdown pipelines
-    for (auto& sp : pipes) sp.running = false;
+    for (auto& sp : pipes) sp->running = false;
     for (auto& sp : pipes) {
-        if (sp.worker.joinable()) sp.worker.join();
+        if (sp->worker.joinable()) sp->worker.join();
     }
 
     // Destroy windows
