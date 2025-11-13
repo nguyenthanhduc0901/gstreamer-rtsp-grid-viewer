@@ -169,7 +169,23 @@ int main(int argc, char** argv) {
         }
 
     g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), "latency", 0, NULL);
-    g_object_set(G_OBJECT(sp->sink), "sync", FALSE, "async", FALSE, NULL);
+    
+    // Enable QoS and frame dropping to prevent accumulation
+    g_object_set(G_OBJECT(sp->sink), 
+        "sync", FALSE,           // No clock sync for lowest latency
+        "async", FALSE,          // No preroll delay
+        "qos", TRUE,             // Enable QoS messages to upstream
+        "max-lateness", 0,       // Drop frames that are late
+        "throttle-time", 0,      // No throttling
+        NULL);
+    
+    // Configure decoder to skip frames when behind
+    if (sp->dec) {
+        g_object_set(G_OBJECT(sp->dec),
+            "skip-frame", 1,      // Skip non-reference frames when late
+            "output-corrupt", FALSE,
+            NULL);
+    }
 
         // Retrieve GtkWidget from gtksink and put into grid
         g_object_get(G_OBJECT(sp->sink), "widget", &sp->widget, NULL);
