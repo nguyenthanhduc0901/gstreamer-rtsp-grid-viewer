@@ -155,10 +155,10 @@ int main(int argc, char** argv) {
         sp->name = std::string("cam") + std::to_string(i+1);
         sp->url  = urls[i];
 
-        sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
-        sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
-        // decide path: use decodebin for rtspt:// (TCP interleaved) streams by default
-        sp->use_decodebin = (sp->url.rfind("rtspt://", 0) == 0);
+    sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
+    sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
+    // Per your gst-launch tests: only cam3 (index 2) uses decodebin; cam4 uses explicit H.265
+    sp->use_decodebin = (i == 2);
         if (sp->use_decodebin) {
             sp->decode   = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
         } else {
