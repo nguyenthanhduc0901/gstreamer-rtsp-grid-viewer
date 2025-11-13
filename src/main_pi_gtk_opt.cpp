@@ -157,23 +157,27 @@ static gboolean on_bus_msg(GstBus* /*bus*/, GstMessage* msg, gpointer user_data)
 }
 
 // Tạo decoder tối ưu cho Raspberry Pi 4 dựa trên codec
+// Prefer software decoders (avdec) to avoid v4l2 negotiation issues at high resolutions
 static GstElement* create_optimal_decoder(const std::string& name, bool use_h265) {
     GstElement* decoder = nullptr;
     if (use_h265) {
-        decoder = gst_element_factory_make("v4l2slh265dec", name.c_str());
-        if (!decoder) {
-            decoder = gst_element_factory_make("avdec_h265", name.c_str());
-            if (decoder) g_print("Using software H265 decoder for %s\n", name.c_str());
+        // Use software H265 decoder first (matches working gst-launch commands)
+        decoder = gst_element_factory_make("avdec_h265", name.c_str());
+        if (decoder) {
+            g_print("Using software H265 decoder (avdec_h265) for %s\n", name.c_str());
         } else {
-            g_print("Using hardware H265 decoder (v4l2slh265dec) for %s\n", name.c_str());
+            // Fallback to hardware if software not available
+            decoder = gst_element_factory_make("v4l2slh265dec", name.c_str());
+            if (decoder) g_print("Using hardware H265 decoder for %s\n", name.c_str());
         }
     } else {
-        decoder = gst_element_factory_make("v4l2h264dec", name.c_str());
-        if (!decoder) {
-            decoder = gst_element_factory_make("avdec_h264", name.c_str());
-            if (decoder) g_print("Using software H264 decoder for %s\n", name.c_str());
+        // Use software H264 decoder first
+        decoder = gst_element_factory_make("avdec_h264", name.c_str());
+        if (decoder) {
+            g_print("Using software H264 decoder (avdec_h264) for %s\n", name.c_str());
         } else {
-            g_print("Using hardware H264 decoder (v4l2h264dec) for %s\n", name.c_str());
+            decoder = gst_element_factory_make("v4l2h264dec", name.c_str());
+            if (decoder) g_print("Using hardware H264 decoder for %s\n", name.c_str());
         }
     }
     return decoder;
