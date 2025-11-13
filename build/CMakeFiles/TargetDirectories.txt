@@ -1,0 +1,3 @@
+C:/Project/gstreamer_demo/build/CMakeFiles/gstreamer_demo.dir
+C:/Project/gstreamer_demo/build/CMakeFiles/ALL_BUILD.dir
+C:/Project/gstreamer_demo/build/CMakeFiles/ZERO_CHECK.dir

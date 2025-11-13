@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Project/gstreamer_demo/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
