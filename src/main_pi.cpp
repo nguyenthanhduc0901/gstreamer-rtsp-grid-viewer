@@ -1,5 +1,3 @@
-// Linux/GTK version: four independent pipelines rendered via gtksink into a 2x2 GtkGrid
-
 #include <gst/gst.h>
 #include <gtk/gtk.h>
 
@@ -18,16 +16,12 @@ struct StreamPipeline {
 
     GstElement* pipeline {nullptr};
     GstElement* src {nullptr};
-    GstElement* decode {nullptr};
-    GstElement* depay {nullptr};
-    GstElement* parse {nullptr};
-    GstElement* dec {nullptr};
+    GstElement* decode {nullptr}; // Sẽ luôn sử dụng decodebin
     GstElement* conv {nullptr};
     GstElement* sink {nullptr};
     GtkWidget*  widget {nullptr};
 
     int backoff_ms {500};
-    bool use_decodebin {false};
 };
 
 static gboolean pad_has_video_caps(GstPad* pad) {
@@ -63,14 +57,14 @@ static void on_decode_pad_added(GstElement* decode, GstPad* pad, gpointer user_d
 static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
     StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
     if (!pad_has_video_caps(pad)) return;
-    GstElement* target = sp->use_decodebin ? sp->decode : sp->depay;
+    GstElement* target = sp->decode; // Luôn là decodebin
     if (!target) return;
     GstPad* sinkpad = gst_element_get_static_pad(target, "sink");
     if (!sinkpad) return;
     if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
     GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
     if (ret != GST_PAD_LINK_OK) {
-        g_printerr("[%s] Failed to link rtspsrc->%s: %d\n", sp->name.c_str(), sp->use_decodebin?"decodebin":"depay", ret);
+        g_printerr("[%s] Failed to link rtspsrc->decodebin: %d\n", sp->name.c_str(), ret);
     }
     gst_object_unref(sinkpad);
 }
@@ -105,7 +99,6 @@ static gboolean on_bus_msg(GstBus* bus, GstMessage* msg, gpointer user_data) {
         gst_message_parse_error(msg, &err, &dbg);
         g_printerr("[%s][ERROR] %s | %s\n", sp->name.c_str(), err?err->message:"", dbg?dbg:"");
         if (err) g_error_free(err); if (dbg) g_free(dbg);
-        // schedule restart with backoff
         g_timeout_add(sp->backoff_ms, restart_pipeline_cb, sp);
         sp->backoff_ms = std::min(sp->backoff_ms * 2, 5000);
         break;
@@ -134,7 +127,7 @@ int main(int argc, char** argv) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 2);
     gtk_container_add(GTK_CONTAINER(window), grid);
 
-    // Replace with your real URLs
+    // Thay thế bằng URL thực của bạn
     std::vector<std::string> urls = {
         "rtsp://admin:tni%40123456@192.168.1.226/Streaming/channels/101",
         "rtsp://admin:tni%40123456@192.168.1.225/Streaming/channels/101",
@@ -142,7 +135,6 @@ int main(int argc, char** argv) {
         "rtspt://hctech:Admin%40123@quangminhhome.dssddns.net:8889/Streaming/Channels/101"
     };
 
-    // Create 4 pipelines and attach gtksink widgets
     std::vector<std::unique_ptr<StreamPipeline>> pipes;
     pipes.reserve(4);
     for (int i = 0; i < 4; ++i) {
@@ -150,44 +142,32 @@ int main(int argc, char** argv) {
         sp->name = std::string("cam") + std::to_string(i+1);
         sp->url  = urls[i];
 
-    sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
-    sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
-    sp->use_decodebin = (i == 2); // cam3 uses decodebin
-        if (sp->use_decodebin) {
-            sp->decode = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
-        } else {
-            sp->depay = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
-            sp->parse = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
-            sp->dec   = gst_element_factory_make("avdec_h265", (sp->name + "_dec").c_str());
-        }
-        sp->conv = gst_element_factory_make("videoconvert", (sp->name + "_conv").c_str());
-        sp->sink = gst_element_factory_make("gtksink", (sp->name + "_sink").c_str());
+        sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
+        sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
+        // === THAY ĐỔI 1: Luôn sử dụng 'decodebin' để tận dụng giải mã phần cứng ===
+        sp->decode   = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
+        sp->conv     = gst_element_factory_make("videoconvert", (sp->name + "_conv").c_str());
+        sp->sink     = gst_element_factory_make("gtksink", (sp->name + "_sink").c_str());
         
-        if (!sp->pipeline || !sp->src || (!sp->use_decodebin && (!sp->depay || !sp->parse || !sp->dec)) || (sp->use_decodebin && !sp->decode) || !sp->conv || !sp->sink) {
+        if (!sp->pipeline || !sp->src || !sp->decode || !sp->conv || !sp->sink) {
             g_printerr("[%s] Failed to create elements\n", sp->name.c_str());
             return -1;
         }
 
-    g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), "latency", 0, NULL);
+        g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), "latency", 200, NULL); // Đặt latency nhỏ để giảm độ trễ
     
-    // Enable QoS and frame dropping to prevent accumulation
-    g_object_set(G_OBJECT(sp->sink), 
-        "sync", FALSE,           // No clock sync for lowest latency
-        "async", FALSE,          // No preroll delay
-        "qos", TRUE,             // Enable QoS messages to upstream
-        "max-lateness", 0,       // Drop frames that are late
-        "throttle-time", 0,      // No throttling
-        NULL);
-    
-    // Configure decoder to skip frames when behind
-    if (sp->dec) {
-        g_object_set(G_OBJECT(sp->dec),
-            "skip-frame", 2,      // Skip non-reference frames when late
-            "output-corrupt", FALSE,
+        // Cấu hình QoS để giảm độ trễ và bỏ frame khi cần thiết
+        g_object_set(G_OBJECT(sp->sink), 
+            "sync", FALSE,
+            "async", FALSE,
+            "qos", TRUE,
+            "max-lateness", G_GUINT64_CONSTANT(50000000), // 50ms
             NULL);
-    }
+    
+        // === THAY ĐỔI 2: Xóa bỏ khối cấu hình "skip-frame" vì không còn cần thiết và gây lỗi ===
+        // Không còn khối g_object_set cho sp->dec ở đây
 
-        // Retrieve GtkWidget from gtksink and put into grid
+        // Lấy GtkWidget từ gtksink và đặt vào grid
         g_object_get(G_OBJECT(sp->sink), "widget", &sp->widget, NULL);
         if (!sp->widget) {
             g_printerr("[%s] gtksink did not provide widget (install gstreamer1.0-gtk3)\n", sp->name.c_str());
@@ -196,22 +176,19 @@ int main(int argc, char** argv) {
         gtk_widget_set_size_request(sp->widget, SUB_W, SUB_H);
         gtk_grid_attach(GTK_GRID(grid), sp->widget, i % 2, i / 2, 1, 1);
 
-        if (sp->use_decodebin) {
-            gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->decode, sp->conv, sp->sink, NULL);
-            if (!gst_element_link_many(sp->conv, sp->sink, NULL)) {
-                g_printerr("[%s] Failed to link conv->sink\n", sp->name.c_str());
-                return -1;
-            }
-            g_signal_connect(sp->decode, "pad-added", G_CALLBACK(on_decode_pad_added), sp.get());
-            g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
-        } else {
-            gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->depay, sp->parse, sp->dec, sp->conv, sp->sink, NULL);
-            if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->conv, sp->sink, NULL)) {
-                g_printerr("[%s] Failed to link depay->parse->dec->conv->sink\n", sp->name.c_str());
-                return -1;
-            }
-            g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
+        // === THAY ĐỔI 3: Đơn giản hóa việc thêm và liên kết các element ===
+        gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->decode, sp->conv, sp->sink, NULL);
+        
+        // Liên kết tĩnh conv -> sink
+        if (!gst_element_link(sp->conv, sp->sink)) {
+            g_printerr("[%s] Failed to link conv->sink\n", sp->name.c_str());
+            return -1;
         }
+
+        // Liên kết động rtspsrc -> decodebin -> videoconvert
+        g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
+        g_signal_connect(sp->decode, "pad-added", G_CALLBACK(on_decode_pad_added), sp.get());
+
 
         GstBus* bus = gst_element_get_bus(sp->pipeline);
         gst_bus_add_watch(bus, on_bus_msg, sp.get());
@@ -229,7 +206,7 @@ int main(int argc, char** argv) {
     gtk_widget_show_all(window);
     gtk_main();
 
-    // Cleanup
+    // Dọn dẹp
     for (auto& sp : pipes) {
         if (sp->pipeline) {
             gst_element_set_state(sp->pipeline, GST_STATE_NULL);
