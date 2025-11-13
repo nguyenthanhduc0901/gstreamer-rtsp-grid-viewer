@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
     // Configure decoder to skip frames when behind
     if (sp->dec) {
         g_object_set(G_OBJECT(sp->dec),
-            "skip-frame", 1,      // Skip non-reference frames when late
+            "skip-frame", 2,      // Skip non-reference frames when late
             "output-corrupt", FALSE,
             NULL);
     }
