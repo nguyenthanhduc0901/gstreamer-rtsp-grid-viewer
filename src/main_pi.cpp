@@ -18,7 +18,9 @@ struct StreamPipeline {
 
     GstElement* pipeline {nullptr};
     GstElement* src {nullptr};
-    GstElement* decode {nullptr};
+    GstElement* depay {nullptr};
+    GstElement* parse {nullptr};
+    GstElement* dec {nullptr};
     GstElement* conv {nullptr};
     GstElement* sink {nullptr};
     GtkWidget*  widget {nullptr};
@@ -43,30 +45,16 @@ static gboolean pad_has_video_caps(GstPad* pad) {
     return is_video;
 }
 
-static void on_decode_pad_added(GstElement* decode, GstPad* pad, gpointer user_data) {
-    StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
-    if (!pad_has_video_caps(pad)) return;
-    if (!sp->conv) return;
-    GstPad* sinkpad = gst_element_get_static_pad(sp->conv, "sink");
-    if (!sinkpad) return;
-    if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
-    GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
-    if (ret != GST_PAD_LINK_OK) {
-        g_printerr("[%s] Failed to link decodebin->videoconvert: %d\n", sp->name.c_str(), ret);
-    }
-    gst_object_unref(sinkpad);
-}
-
 static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
     StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
     if (!pad_has_video_caps(pad)) return;
-    if (!sp->decode) return;
-    GstPad* sinkpad = gst_element_get_static_pad(sp->decode, "sink");
+    if (!sp->depay) return;
+    GstPad* sinkpad = gst_element_get_static_pad(sp->depay, "sink");
     if (!sinkpad) return;
     if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
     GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
     if (ret != GST_PAD_LINK_OK) {
-        g_printerr("[%s] Failed to link rtspsrc->decodebin: %d\n", sp->name.c_str(), ret);
+        g_printerr("[%s] Failed to link rtspsrc->depay: %d\n", sp->name.c_str(), ret);
     }
     gst_object_unref(sinkpad);
 }
@@ -148,10 +136,12 @@ int main(int argc, char** argv) {
 
         sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
         sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
-        sp->decode   = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
+        sp->depay    = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
+        sp->parse    = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
+        sp->dec      = gst_element_factory_make("avdec_h265", (sp->name + "_dec").c_str());
         sp->conv     = gst_element_factory_make("videoconvert", (sp->name + "_conv").c_str());
         sp->sink     = gst_element_factory_make("gtksink", (sp->name + "_sink").c_str());
-        if (!sp->pipeline || !sp->src || !sp->decode || !sp->conv || !sp->sink) {
+        if (!sp->pipeline || !sp->src || !sp->depay || !sp->parse || !sp->dec || !sp->conv || !sp->sink) {
             g_printerr("[%s] Failed to create elements\n", sp->name.c_str());
             return -1;
         }
@@ -170,14 +160,13 @@ int main(int argc, char** argv) {
         gtk_widget_set_size_request(sp->widget, SUB_W, SUB_H);
         gtk_grid_attach(GTK_GRID(grid), sp->widget, i % 2, i / 2, 1, 1);
 
-        gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->decode, sp->conv, sp->sink, NULL);
-        if (!gst_element_link_many(sp->conv, sp->sink, NULL)) {
-            g_printerr("[%s] Failed to link conv->sink\n", sp->name.c_str());
+        gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->depay, sp->parse, sp->dec, sp->conv, sp->sink, NULL);
+        if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->conv, sp->sink, NULL)) {
+            g_printerr("[%s] Failed to link depay->parse->dec->conv->sink\n", sp->name.c_str());
             return -1;
         }
 
-        g_signal_connect(sp->decode, "pad-added", G_CALLBACK(on_decode_pad_added), sp.get());
-        g_signal_connect(sp->src,    "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
+        g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
 
         GstBus* bus = gst_element_get_bus(sp->pipeline);
         gst_bus_add_watch(bus, on_bus_msg, sp.get());
