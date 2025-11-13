@@ -18,6 +18,7 @@ struct StreamPipeline {
 
     GstElement* pipeline {nullptr};
     GstElement* src {nullptr};
+    GstElement* decode {nullptr};
     GstElement* depay {nullptr};
     GstElement* parse {nullptr};
     GstElement* dec {nullptr};
@@ -29,6 +30,7 @@ struct StreamPipeline {
     GtkWidget*  widget {nullptr};
 
     int backoff_ms {500};
+    bool use_decodebin {false};
 };
 
 static gboolean pad_has_video_caps(GstPad* pad) {
@@ -48,16 +50,32 @@ static gboolean pad_has_video_caps(GstPad* pad) {
     return is_video;
 }
 
-static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
+static void on_decode_pad_added(GstElement* decode, GstPad* pad, gpointer user_data) {
     StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
     if (!pad_has_video_caps(pad)) return;
-    if (!sp->depay) return;
-    GstPad* sinkpad = gst_element_get_static_pad(sp->depay, "sink");
+    GstElement* next = sp->queue ? sp->queue : sp->conv;
+    if (!next) return;
+    GstPad* sinkpad = gst_element_get_static_pad(next, "sink");
     if (!sinkpad) return;
     if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
     GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
     if (ret != GST_PAD_LINK_OK) {
-        g_printerr("[%s] Failed to link rtspsrc->depay: %d\n", sp->name.c_str(), ret);
+        g_printerr("[%s] Failed to link decodebin->next: %d\n", sp->name.c_str(), ret);
+    }
+    gst_object_unref(sinkpad);
+}
+
+static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
+    StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
+    if (!pad_has_video_caps(pad)) return;
+    GstElement* target = sp->use_decodebin ? sp->decode : sp->depay;
+    if (!target) return;
+    GstPad* sinkpad = gst_element_get_static_pad(target, "sink");
+    if (!sinkpad) return;
+    if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
+    GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
+    if (ret != GST_PAD_LINK_OK) {
+        g_printerr("[%s] Failed to link rtspsrc->%s: %d\n", sp->name.c_str(), sp->use_decodebin?"decodebin":"depay", ret);
     }
     gst_object_unref(sinkpad);
 }
@@ -125,8 +143,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> urls = {
         "rtsp://admin:tni%40123456@192.168.1.226/Streaming/channels/101",
         "rtsp://admin:tni%40123456@192.168.1.225/Streaming/channels/101",
-        "rtsp://admin:TpcomsNOC107@103.141.176.254:7072/Streaming/Channels/101",
-        "rtsp://hctech:Admin%40123@quangminhhome.dssddns.net:8889/Streaming/Channels/101"
+        "rtspt://admin:TpcomsNOC107@103.141.176.254:7072/Streaming/Channels/101",
+        "rtspt://hctech:Admin%40123@quangminhhome.dssddns.net:8889/Streaming/Channels/101"
     };
 
     // Create 4 pipelines and attach gtksink widgets
@@ -139,15 +157,21 @@ int main(int argc, char** argv) {
 
         sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
         sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
-        sp->depay    = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
-        sp->parse    = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
-        sp->dec      = gst_element_factory_make("avdec_h265", (sp->name + "_dec").c_str());
+        // decide path: use decodebin for rtspt:// (TCP interleaved) streams by default
+        sp->use_decodebin = (sp->url.rfind("rtspt://", 0) == 0);
+        if (sp->use_decodebin) {
+            sp->decode   = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
+        } else {
+            sp->depay    = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
+            sp->parse    = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
+            sp->dec      = gst_element_factory_make("avdec_h265", (sp->name + "_dec").c_str());
+        }
         sp->queue    = gst_element_factory_make("queue", (sp->name + "_q").c_str());
         sp->scale    = gst_element_factory_make("videoscale", (sp->name + "_scale").c_str());
         sp->capsf    = gst_element_factory_make("capsfilter", (sp->name + "_caps").c_str());
         sp->conv     = gst_element_factory_make("videoconvert", (sp->name + "_conv").c_str());
         sp->sink     = gst_element_factory_make("gtksink", (sp->name + "_sink").c_str());
-        if (!sp->pipeline || !sp->src || !sp->depay || !sp->parse || !sp->dec || !sp->queue || !sp->scale || !sp->capsf || !sp->conv || !sp->sink) {
+        if (!sp->pipeline || !sp->src || (!sp->use_decodebin && (!sp->depay || !sp->parse || !sp->dec)) || (sp->use_decodebin && !sp->decode) || !sp->queue || !sp->scale || !sp->capsf || !sp->conv || !sp->sink) {
             g_printerr("[%s] Failed to create elements\n", sp->name.c_str());
             return -1;
         }
@@ -179,13 +203,22 @@ int main(int argc, char** argv) {
         gtk_widget_set_size_request(sp->widget, SUB_W, SUB_H);
         gtk_grid_attach(GTK_GRID(grid), sp->widget, i % 2, i / 2, 1, 1);
 
-        gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL);
-        if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL)) {
-            g_printerr("[%s] Failed to link depay->parse->dec->queue->scale->caps->conv->sink\n", sp->name.c_str());
-            return -1;
+        if (sp->use_decodebin) {
+            gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->decode, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL);
+            if (!gst_element_link_many(sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL)) {
+                g_printerr("[%s] Failed to link queue->scale->caps->conv->sink\n", sp->name.c_str());
+                return -1;
+            }
+            g_signal_connect(sp->decode, "pad-added", G_CALLBACK(on_decode_pad_added), sp.get());
+            g_signal_connect(sp->src,    "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
+        } else {
+            gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL);
+            if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL)) {
+                g_printerr("[%s] Failed to link depay->parse->dec->queue->scale->caps->conv->sink\n", sp->name.c_str());
+                return -1;
+            }
+            g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
         }
-
-        g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
 
         GstBus* bus = gst_element_get_bus(sp->pipeline);
         gst_bus_add_watch(bus, on_bus_msg, sp.get());
