@@ -24,9 +24,11 @@ struct StreamPipeline {
 
     GstElement* pipeline {nullptr};
     GstElement* src {nullptr};
-    GstElement* depay {nullptr};
-    GstElement* parse {nullptr};
-    GstElement* dec {nullptr};
+    GstElement* decode {nullptr};
+    GstElement* q1 {nullptr};
+    GstElement* conv {nullptr};
+    GstElement* scale {nullptr};
+    GstElement* capsf {nullptr};
     GstElement* sink {nullptr};
 
     std::thread worker;
@@ -45,60 +47,36 @@ static gboolean pad_has_video_caps(GstPad* pad) {
              const gchar* media = gst_structure_get_string(st, "media");
              if (media && g_strcmp0(media, "video") == 0) is_video = TRUE;
         }
+        if (g_str_has_prefix(name, "video/")) {
+            is_video = TRUE;
+        }
         gst_caps_unref(caps);
     }
     return is_video;
 }
 
-static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
+static void on_decode_pad_added(GstElement* /*decodebin*/, GstPad* pad, gpointer user_data) {
     StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
     if (!pad_has_video_caps(pad)) return;
-    
-    // Tìm codec (H265 hay H264?)
-    GstCaps* caps = gst_pad_get_current_caps(pad);
-    const gchar* encoding_name = gst_structure_get_string(gst_caps_get_structure(caps, 0), "encoding-name");
-    
-    // Tự động tạo depay và parse dựa trên codec
-    if (g_str_equal(encoding_name, "H265")) {
-        sp->depay = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
-        sp->parse = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
-        // Yêu cầu bộ giải mã phần cứng H.265
-        sp->dec   = gst_element_factory_make("v4l2slh265dec", (sp->name + "_dec").c_str());
-    } else if (g_str_equal(encoding_name, "H264")) {
-        sp->depay = gst_element_factory_make("rtph264depay", (sp->name + "_depay").c_str());
-        sp->parse = gst_element_factory_make("h264parse", (sp->name + "_parse").c_str());
-        // Yêu cầu bộ giải mã phần cứng H.264
-        sp->dec   = gst_element_factory_make("v4l2h264dec", (sp->name + "_dec").c_str());
-    } else {
-        g_printerr("[%s] Codec không được hỗ trợ: %s\n", sp->name.c_str(), encoding_name);
-        gst_caps_unref(caps);
-        return;
-    }
-    gst_caps_unref(caps);
-
-    if (!sp->depay || !sp->parse || !sp->dec) {
-        g_printerr("[%s] Không thể tạo elements cho codec!\n", sp->name.c_str());
-        return;
-    }
-
-    // Thêm các elements mới vào pipeline
-    gst_bin_add_many(GST_BIN(sp->pipeline), sp->depay, sp->parse, sp->dec, NULL);
-    // Link chúng lại với nhau và với sink
-    if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->sink, NULL)) {
-         g_printerr("[%s] Failed to link depay->parse->dec->sink\n", sp->name.c_str());
-    }
-    gst_element_sync_state_with_parent(sp->depay);
-    gst_element_sync_state_with_parent(sp->parse);
-    gst_element_sync_state_with_parent(sp->dec);
-
-    // Link rtspsrc với depay
-    GstPad* sinkpad = gst_element_get_static_pad(sp->depay, "sink");
+    GstPad* sinkpad = gst_element_get_static_pad(sp->q1, "sink");
     if (!sinkpad) return;
     if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
-    
     GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
     if (ret != GST_PAD_LINK_OK) {
-        g_printerr("[%s] Failed to link rtspsrc->depay: %d\n", sp->name.c_str(), ret);
+        g_printerr("[%s] Failed to link decodebin to queue: %d\n", sp->name.c_str(), ret);
+    }
+    gst_object_unref(sinkpad);
+}
+
+static void on_src_pad_added(GstElement* /*src*/, GstPad* pad, gpointer user_data) {
+    StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
+    if (!pad_has_video_caps(pad)) return;
+    GstPad* sinkpad = gst_element_get_static_pad(sp->decode, "sink");
+    if (!sinkpad) return;
+    if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
+    GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
+    if (ret != GST_PAD_LINK_OK) {
+        g_printerr("[%s] Failed to link rtspsrc to decodebin: %d\n", sp->name.c_str(), ret);
     }
     gst_object_unref(sinkpad);
 }
@@ -106,9 +84,14 @@ static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
 static bool build_and_play(StreamPipeline* sp) {
     sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
     sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
+    sp->decode   = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
+    sp->q1       = gst_element_factory_make("queue", (sp->name + "_q1").c_str());
+    sp->conv     = gst_element_factory_make("videoconvert", (sp->name + "_conv").c_str());
+    sp->scale    = gst_element_factory_make("videoscale", (sp->name + "_scale").c_str());
+    sp->capsf    = gst_element_factory_make("capsfilter", (sp->name + "_caps").c_str());
     sp->sink     = gst_element_factory_make("kmssink", (sp->name + "_sink").c_str());
     
-    if (!sp->pipeline || !sp->src || !sp->sink) {
+    if (!sp->pipeline || !sp->src || !sp->decode || !sp->q1 || !sp->conv || !sp->scale || !sp->capsf || !sp->sink) {
         g_printerr("[%s] Failed to create core elements\n", sp->name.c_str());
         return false;
     }
@@ -116,7 +99,6 @@ static bool build_and_play(StreamPipeline* sp) {
     // --- Cấu hình RTSP cho độ trễ thấp ---
     g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), NULL);
     g_object_set(G_OBJECT(sp->src), "latency", 0, NULL);
-    g_object_set(G_OBJECT(sp->src), "drop-on-lateness", TRUE, NULL);
     g_object_set(G_OBJECT(sp->src), "protocols", 4 /* TCP */, NULL); // Ưu tiên TCP
 
     // --- Cấu hình KMSSink cho Zero-Copy và Grid ---
@@ -133,16 +115,37 @@ static bool build_and_play(StreamPipeline* sp) {
         "sync", FALSE,       // Vẽ ngay khi có
         "async", FALSE,      // Giảm độ trễ
         "force-aspect-ratio", TRUE,
-        "can-scale", FALSE,  // Tắt scaling của kmssink, để phần cứng tự scale
         NULL);
     g_free(rect);
     
-    // Thêm các elements cốt lõi (depay, parse, dec sẽ được thêm trong on_src_pad_added)
-    gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->sink, NULL);
+    // Downscale sớm để giảm tải (mỗi tile w2 x h2)
+    GstCaps* vcaps = gst_caps_new_simple("video/x-raw",
+        "width", G_TYPE_INT, w2,
+        "height", G_TYPE_INT, h2,
+        NULL);
+    g_object_set(G_OBJECT(sp->capsf), "caps", vcaps, NULL);
+    gst_caps_unref(vcaps);
+
+    // Queue leaky để tránh tích tụ khi decode chậm
+    g_object_set(G_OBJECT(sp->q1),
+        "leaky", 2, /* downstream */
+        "max-size-buffers", 2,
+        "max-size-bytes", 0,
+        "max-size-time", 0,
+        NULL);
+
+    // Thêm các elements cốt lõi
+    gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->decode, sp->q1, sp->conv, sp->scale, sp->capsf, sp->sink, NULL);
 
     // Connect dynamic pad handler
-    // CHÚ Ý: Chúng ta không link trước, chúng ta link MỌI THỨ trong callback
     g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp);
+    g_signal_connect(sp->decode, "pad-added", G_CALLBACK(on_decode_pad_added), sp);
+
+    // Link phần tĩnh: q1 -> conv -> scale -> capsf -> sink
+    if (!gst_element_link_many(sp->q1, sp->conv, sp->scale, sp->capsf, sp->sink, NULL)) {
+        g_printerr("[%s] Failed to link q1->conv->scale->caps->sink\n", sp->name.c_str());
+        return false;
+    }
 
     GstStateChangeReturn sret = gst_element_set_state(sp->pipeline, GST_STATE_PLAYING);
     if (sret == GST_STATE_CHANGE_FAILURE) {
@@ -160,7 +163,7 @@ static void stop_and_cleanup(StreamPipeline* sp) {
         gst_object_unref(sp->pipeline);
     }
     // GStreamer tự dọn dẹp các element con khi pipeline bị unref
-    sp->pipeline = sp->src = sp->depay = sp->parse = sp->dec = sp->sink = nullptr;
+    sp->pipeline = sp->src = sp->decode = sp->q1 = sp->conv = sp->scale = sp->capsf = sp->sink = nullptr;
 }
 
 static void pipeline_worker(StreamPipeline* sp) {
