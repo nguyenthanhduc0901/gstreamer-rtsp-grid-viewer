@@ -21,6 +21,9 @@ struct StreamPipeline {
     GstElement* depay {nullptr};
     GstElement* parse {nullptr};
     GstElement* dec {nullptr};
+    GstElement* queue {nullptr};
+    GstElement* scale {nullptr};
+    GstElement* capsf {nullptr};
     GstElement* conv {nullptr};
     GstElement* sink {nullptr};
     GtkWidget*  widget {nullptr};
@@ -139,17 +142,31 @@ int main(int argc, char** argv) {
         sp->depay    = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
         sp->parse    = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
         sp->dec      = gst_element_factory_make("avdec_h265", (sp->name + "_dec").c_str());
+        sp->queue    = gst_element_factory_make("queue", (sp->name + "_q").c_str());
+        sp->scale    = gst_element_factory_make("videoscale", (sp->name + "_scale").c_str());
+        sp->capsf    = gst_element_factory_make("capsfilter", (sp->name + "_caps").c_str());
         sp->conv     = gst_element_factory_make("videoconvert", (sp->name + "_conv").c_str());
         sp->sink     = gst_element_factory_make("gtksink", (sp->name + "_sink").c_str());
-        if (!sp->pipeline || !sp->src || !sp->depay || !sp->parse || !sp->dec || !sp->conv || !sp->sink) {
+        if (!sp->pipeline || !sp->src || !sp->depay || !sp->parse || !sp->dec || !sp->queue || !sp->scale || !sp->capsf || !sp->conv || !sp->sink) {
             g_printerr("[%s] Failed to create elements\n", sp->name.c_str());
             return -1;
         }
 
-        g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), NULL);
-        g_object_set(G_OBJECT(sp->src), "latency", 0, NULL);
-        g_object_set(G_OBJECT(sp->sink), "sync", TRUE, NULL);
-        g_object_set(G_OBJECT(sp->sink), "force-aspect-ratio", TRUE, NULL);
+    g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), NULL);
+    g_object_set(G_OBJECT(sp->src), "latency", 50, NULL); // small buffer to smooth jitter
+    g_object_set(G_OBJECT(sp->sink), "sync", FALSE, NULL); // render ASAP to reduce lag
+    g_object_set(G_OBJECT(sp->sink), "force-aspect-ratio", TRUE, NULL);
+
+    // Leaky queue to drop old frames when decoder is slow
+    g_object_set(G_OBJECT(sp->queue), "leaky", 2 /*downstream*/, "max-size-buffers", 1, "max-size-bytes", 0, "max-size-time", 0, NULL);
+
+    // Scale down to SUB_W x SUB_H early after decode to reduce copy cost
+    GstCaps* caps = gst_caps_new_simple("video/x-raw",
+                        "width", G_TYPE_INT, SUB_W,
+                        "height", G_TYPE_INT, SUB_H,
+                        NULL);
+    g_object_set(G_OBJECT(sp->capsf), "caps", caps, NULL);
+    gst_caps_unref(caps);
 
         // Retrieve GtkWidget from gtksink and put into grid
         g_object_get(G_OBJECT(sp->sink), "widget", &sp->widget, NULL);
@@ -160,9 +177,9 @@ int main(int argc, char** argv) {
         gtk_widget_set_size_request(sp->widget, SUB_W, SUB_H);
         gtk_grid_attach(GTK_GRID(grid), sp->widget, i % 2, i / 2, 1, 1);
 
-        gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->depay, sp->parse, sp->dec, sp->conv, sp->sink, NULL);
-        if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->conv, sp->sink, NULL)) {
-            g_printerr("[%s] Failed to link depay->parse->dec->conv->sink\n", sp->name.c_str());
+        gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL);
+        if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL)) {
+            g_printerr("[%s] Failed to link depay->parse->dec->queue->scale->caps->conv->sink\n", sp->name.c_str());
             return -1;
         }
 
