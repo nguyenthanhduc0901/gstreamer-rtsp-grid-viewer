@@ -7,6 +7,7 @@
 #include <vector>
 #include <iostream>
 #include <memory>
+#include <algorithm>
 
 static const int SUB_W = 640;
 static const int SUB_H = 360;
@@ -117,6 +118,7 @@ static gboolean on_bus_msg(GstBus* bus, GstMessage* msg, gpointer user_data) {
 
 int main(int argc, char** argv) {
     gtk_init(&argc, &argv);
+    gst_init(&argc, &argv);
 
     GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), "GStreamer 2x2 (GTK)");
