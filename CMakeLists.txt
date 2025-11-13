@@ -14,6 +14,9 @@ include(CheckIncludeFiles)
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)
   pkg_check_modules(GST QUIET gstreamer-1.0>=1.18 gstreamer-video-1.0 gobject-2.0 glib-2.0)
+  if(UNIX AND NOT APPLE)
+    pkg_check_modules(GTK3 QUIET gtk+-3.0)
+  endif()
 endif()
 
 # Fallback: use Windows GStreamer MSI environment variable
@@ -85,7 +88,19 @@ else()
   target_link_libraries(gstreamer_demo PRIVATE ${GST_LDFLAGS} ${GST_LDFLAGS_OTHER})
 endif()
 
-# Link X11 on Linux for Xlib window embedding (GstVideoOverlay)
+# GTK3 (Linux) for gtksink UI
+if(UNIX AND NOT APPLE AND GTK3_FOUND)
+  target_include_directories(gstreamer_demo PRIVATE ${GTK3_INCLUDE_DIRS})
+  if(GTK3_CFLAGS_OTHER)
+    target_compile_options(gstreamer_demo PRIVATE ${GTK3_CFLAGS_OTHER})
+  endif()
+  if(GTK3_LIBRARY_DIRS)
+    target_link_directories(gstreamer_demo PRIVATE ${GTK3_LIBRARY_DIRS})
+  endif()
+  target_link_libraries(gstreamer_demo PRIVATE ${GTK3_LIBRARIES})
+endif()
+
+# X11 link no longer required when using GTK + gtksink; keep optional if present
 if(UNIX AND NOT APPLE)
   find_package(X11 QUIET)
   if(X11_FOUND)
