@@ -1,4 +1,6 @@
-// Linux/GTK version: four independent pipelines rendered via gtksink into a 2x2 GtkGrid
+// Linux/GTK version: Tối ưu cho độ trễ thấp nhất, bỏ qua tài nguyên.
+// Sử dụng decodebin để tự động chọn phần cứng giải mã (hardware decoder)
+// và gtksink để render bằng GPU (Zero-Copy nếu có thể).
 
 #include <gst/gst.h>
 #include <gtk/gtk.h>
@@ -9,6 +11,7 @@
 #include <memory>
 #include <algorithm>
 
+// Kích thước widget mặc định (gtksink sẽ tự scale)
 static const int SUB_W = 640;
 static const int SUB_H = 360;
 
@@ -17,22 +20,15 @@ struct StreamPipeline {
     std::string url;
 
     GstElement* pipeline {nullptr};
-    GstElement* src {nullptr};
-    GstElement* decode {nullptr};
-    GstElement* depay {nullptr};
-    GstElement* parse {nullptr};
-    GstElement* dec {nullptr};
-    GstElement* queue {nullptr};
-    GstElement* scale {nullptr};
-    GstElement* capsf {nullptr};
-    GstElement* conv {nullptr};
-    GstElement* sink {nullptr};
-    GtkWidget*  widget {nullptr};
+    GstElement* src {nullptr};      // rtspsrc
+    GstElement* decode {nullptr};   // decodebin
+    GstElement* sink {nullptr};     // gtksink
+    GtkWidget* widget {nullptr};
 
     int backoff_ms {500};
-    bool use_decodebin {false};
 };
 
+// Kiểm tra xem pad có phải là video không (để bỏ qua audio)
 static gboolean pad_has_video_caps(GstPad* pad) {
     GstCaps* caps = gst_pad_get_current_caps(pad);
     if (!caps) caps = gst_pad_query_caps(pad, nullptr);
@@ -50,35 +46,64 @@ static gboolean pad_has_video_caps(GstPad* pad) {
     return is_video;
 }
 
+// Callback khi decodebin tạo ra một pad (đã giải mã)
 static void on_decode_pad_added(GstElement* decode, GstPad* pad, gpointer user_data) {
     StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
-    if (!pad_has_video_caps(pad)) return;
-    GstElement* next = sp->queue ? sp->queue : sp->conv;
-    if (!next) return;
-    GstPad* sinkpad = gst_element_get_static_pad(next, "sink");
-    if (!sinkpad) return;
-    if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
+    
+    // Chỉ link pad video, bỏ qua audio
+    if (!pad_has_video_caps(pad)) {
+        g_printerr("[%s] Bỏ qua pad không phải video\n", sp->name.c_str());
+        return;
+    }
+
+    // Link pad mới này trực tiếp tới gtksink
+    GstPad* sinkpad = gst_element_get_static_pad(sp->sink, "sink");
+    if (!sinkpad) {
+        g_printerr("[%s] Không lấy được sink pad của gtksink\n", sp->name.c_str());
+        return;
+    }
+    if (gst_pad_is_linked(sinkpad)) {
+        gst_object_unref(sinkpad);
+        return;
+    }
+
     GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
     if (ret != GST_PAD_LINK_OK) {
-        g_printerr("[%s] Failed to link decodebin->next: %d\n", sp->name.c_str(), ret);
+        g_printerr("[%s] Failed to link decodebin -> gtksink: %d\n", sp->name.c_str(), ret);
+    } else {
+        g_printerr("[%s] Đã link decodebin -> gtksink\n", sp->name.c_str());
     }
     gst_object_unref(sinkpad);
 }
 
+// Callback khi rtspsrc tạo ra một pad (H264/H265)
 static void on_src_pad_added(GstElement* src, GstPad* pad, gpointer user_data) {
     StreamPipeline* sp = reinterpret_cast<StreamPipeline*>(user_data);
+
+    // Chỉ link pad video
     if (!pad_has_video_caps(pad)) return;
-    GstElement* target = sp->use_decodebin ? sp->decode : sp->depay;
-    if (!target) return;
-    GstPad* sinkpad = gst_element_get_static_pad(target, "sink");
-    if (!sinkpad) return;
-    if (gst_pad_is_linked(sinkpad)) { gst_object_unref(sinkpad); return; }
+
+    // Link pad mới này trực tiếp tới decodebin
+    GstPad* sinkpad = gst_element_get_static_pad(sp->decode, "sink");
+    if (!sinkpad) {
+         g_printerr("[%s] Không lấy được sink pad của decodebin\n", sp->name.c_str());
+        return;
+    }
+    if (gst_pad_is_linked(sinkpad)) {
+        gst_object_unref(sinkpad);
+        return;
+    }
+
     GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
     if (ret != GST_PAD_LINK_OK) {
-        g_printerr("[%s] Failed to link rtspsrc->%s: %d\n", sp->name.c_str(), sp->use_decodebin?"decodebin":"depay", ret);
+        g_printerr("[%s] Failed to link rtspsrc -> decodebin: %d\n", sp->name.c_str(), ret);
+    } else {
+         g_printerr("[%s] Đã link rtspsrc -> decodebin\n", sp->name.c_str());
     }
     gst_object_unref(sinkpad);
 }
+
+// Logic khởi động lại pipeline (giữ nguyên)
 static gboolean restart_pipeline_cb(gpointer user_data) {
     StreamPipeline* sp = static_cast<StreamPipeline*>(user_data);
     if (!sp || !sp->pipeline) return G_SOURCE_REMOVE;
@@ -95,6 +120,7 @@ static gboolean restart_pipeline_cb(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
+// Logic theo dõi bus (giữ nguyên)
 static gboolean on_bus_msg(GstBus* bus, GstMessage* msg, gpointer user_data) {
     StreamPipeline* sp = static_cast<StreamPipeline*>(user_data);
     switch (GST_MESSAGE_TYPE(msg)) {
@@ -110,7 +136,6 @@ static gboolean on_bus_msg(GstBus* bus, GstMessage* msg, gpointer user_data) {
         gst_message_parse_error(msg, &err, &dbg);
         g_printerr("[%s][ERROR] %s | %s\n", sp->name.c_str(), err?err->message:"", dbg?dbg:"");
         if (err) g_error_free(err); if (dbg) g_free(dbg);
-        // schedule restart with backoff
         g_timeout_add(sp->backoff_ms, restart_pipeline_cb, sp);
         sp->backoff_ms = std::min(sp->backoff_ms * 2, 5000);
         break;
@@ -130,7 +155,7 @@ int main(int argc, char** argv) {
     gst_init(&argc, &argv);
 
     GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "GStreamer 2x2 (GTK)");
+    gtk_window_set_title(GTK_WINDOW(window), "GStreamer 2x2 (LOW-LATENCY)");
     gtk_window_set_default_size(GTK_WINDOW(window), SUB_W * 2, SUB_H * 2);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
@@ -139,7 +164,6 @@ int main(int argc, char** argv) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 2);
     gtk_container_add(GTK_CONTAINER(window), grid);
 
-    // Replace with your real URLs
     std::vector<std::string> urls = {
         "rtsp://admin:tni%40123456@192.168.1.226/Streaming/channels/101",
         "rtsp://admin:tni%40123456@192.168.1.225/Streaming/channels/101",
@@ -147,7 +171,6 @@ int main(int argc, char** argv) {
         "rtspt://hctech:Admin%40123@quangminhhome.dssddns.net:8889/Streaming/Channels/101"
     };
 
-    // Create 4 pipelines and attach gtksink widgets
     std::vector<std::unique_ptr<StreamPipeline>> pipes;
     pipes.reserve(4);
     for (int i = 0; i < 4; ++i) {
@@ -155,79 +178,61 @@ int main(int argc, char** argv) {
         sp->name = std::string("cam") + std::to_string(i+1);
         sp->url  = urls[i];
 
-    sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
-    sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
-    // Per your gst-launch tests: only cam3 (index 2) uses decodebin; cam4 uses explicit H.265
-    sp->use_decodebin = (i == 2);
-        if (sp->use_decodebin) {
-            sp->decode   = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
-        } else {
-            sp->depay    = gst_element_factory_make("rtph265depay", (sp->name + "_depay").c_str());
-            sp->parse    = gst_element_factory_make("h265parse", (sp->name + "_parse").c_str());
-            sp->dec      = gst_element_factory_make("avdec_h265", (sp->name + "_dec").c_str());
-        }
-        sp->queue    = gst_element_factory_make("queue", (sp->name + "_q").c_str());
-        sp->scale    = gst_element_factory_make("videoscale", (sp->name + "_scale").c_str());
-        sp->capsf    = gst_element_factory_make("capsfilter", (sp->name + "_caps").c_str());
-        sp->conv     = gst_element_factory_make("videoconvert", (sp->name + "_conv").c_str());
+        // --- Tạo Pipeline Tối giản ---
+        sp->pipeline = gst_pipeline_new((sp->name + "_pipe").c_str());
+        sp->src      = gst_element_factory_make("rtspsrc", (sp->name + "_src").c_str());
+        sp->decode   = gst_element_factory_make("decodebin", (sp->name + "_decbin").c_str());
         sp->sink     = gst_element_factory_make("gtksink", (sp->name + "_sink").c_str());
-        if (!sp->pipeline || !sp->src || (!sp->use_decodebin && (!sp->depay || !sp->parse || !sp->dec)) || (sp->use_decodebin && !sp->decode) || !sp->queue || !sp->scale || !sp->capsf || !sp->conv || !sp->sink) {
+        
+        if (!sp->pipeline || !sp->src || !sp->decode || !sp->sink) {
             g_printerr("[%s] Failed to create elements\n", sp->name.c_str());
             return -1;
         }
 
-    g_object_set(G_OBJECT(sp->src), "location", sp->url.c_str(), NULL);
-    g_object_set(G_OBJECT(sp->src), "latency", 0, NULL); // strict low-latency per request
-    // Note: 'drop-on-lateness' is not a valid property on rtspsrc; late frame dropping is handled by sink/QoS
-    g_object_set(G_OBJECT(sp->sink), "sync", FALSE, NULL); // render ASAP to reduce lag
-    g_object_set(G_OBJECT(sp->sink), "async", FALSE, NULL); // minimize preroll
-    g_object_set(G_OBJECT(sp->sink), "force-aspect-ratio", TRUE, NULL);
+        // --- Cấu hình CỰC ĐOAN (AGGRESSIVE) cho độ trễ thấp ---
+        g_object_set(G_OBJECT(sp->src), 
+            "location", sp->url.c_str(),
+            "latency", 0,                  // Yêu cầu buffer = 0
+            "drop-on-lateness", TRUE,      // Bỏ khung hình trễ
+            "ntp-sync", FALSE,             // Không đồng bộ với server NTP
+            "protocols", 4, /* TCP */      // Ưu tiên TCP để tránh mất gói (rtspt://)
+            NULL);
+        
+        g_object_set(G_OBJECT(sp->sink), 
+            "sync", FALSE,                 // TẮT đồng bộ (vẽ ngay lập tức)
+            "async", FALSE,                // TẮT đồng bộ (vẽ ngay lập tức)
+            "qos", FALSE,                  // TẮT Quality-of-Service (không chờ, không báo cáo)
+            "force-aspect-ratio", TRUE,
+            NULL);
 
-    // Leaky queue to drop old frames when decoder is slow
-    g_object_set(G_OBJECT(sp->queue), "leaky", 2 /*downstream*/, "max-size-buffers", 1, "max-size-bytes", 0, "max-size-time", 0, NULL);
-
-    // Scale down to SUB_W x SUB_H early after decode to reduce copy cost
-    GstCaps* caps = gst_caps_new_simple("video/x-raw",
-                        "width", G_TYPE_INT, SUB_W,
-                        "height", G_TYPE_INT, SUB_H,
-                        NULL);
-    g_object_set(G_OBJECT(sp->capsf), "caps", caps, NULL);
-    gst_caps_unref(caps);
-
-        // Retrieve GtkWidget from gtksink and put into grid
+        // Lấy widget từ gtksink và thêm vào grid
         g_object_get(G_OBJECT(sp->sink), "widget", &sp->widget, NULL);
         if (!sp->widget) {
-            g_printerr("[%s] gtksink did not provide widget (install gstreamer1.0-gtk3)\n", sp->name.c_str());
+            g_printerr("[%s] gtksink did not provide widget\n", sp->name.c_str());
             return -1;
         }
         gtk_widget_set_size_request(sp->widget, SUB_W, SUB_H);
         gtk_grid_attach(GTK_GRID(grid), sp->widget, i % 2, i / 2, 1, 1);
 
-        if (sp->use_decodebin) {
-            gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->decode, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL);
-            if (!gst_element_link_many(sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL)) {
-                g_printerr("[%s] Failed to link queue->scale->caps->conv->sink\n", sp->name.c_str());
-                return -1;
-            }
-            g_signal_connect(sp->decode, "pad-added", G_CALLBACK(on_decode_pad_added), sp.get());
-            g_signal_connect(sp->src,    "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
-        } else {
-            gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL);
-            if (!gst_element_link_many(sp->depay, sp->parse, sp->dec, sp->queue, sp->scale, sp->capsf, sp->conv, sp->sink, NULL)) {
-                g_printerr("[%s] Failed to link depay->parse->dec->queue->scale->caps->conv->sink\n", sp->name.c_str());
-                return -1;
-            }
-            g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
-        }
+        // Thêm elements vào pipeline
+        gst_bin_add_many(GST_BIN(sp->pipeline), sp->src, sp->decode, sp->sink, NULL);
 
+        // --- Kết nối động (Dynamic Linking) ---
+        // 1. rtspsrc sẽ link tới decodebin
+        g_signal_connect(sp->src, "pad-added", G_CALLBACK(on_src_pad_added), sp.get());
+        // 2. decodebin sẽ link tới gtksink
+        g_signal_connect(sp->decode, "pad-added", G_CALLBACK(on_decode_pad_added), sp.get());
+        // (Không có link tĩnh nào cả)
+
+        // Theo dõi lỗi
         GstBus* bus = gst_element_get_bus(sp->pipeline);
         gst_bus_add_watch(bus, on_bus_msg, sp.get());
         gst_object_unref(bus);
 
+        // Chạy
         GstStateChangeReturn sret = gst_element_set_state(sp->pipeline, GST_STATE_PLAYING);
         if (sret == GST_STATE_CHANGE_FAILURE) {
             g_printerr("[%s] Failed to set PLAYING\n", sp->name.c_str());
-            return -1;
         }
 
         pipes.push_back(std::move(sp));
